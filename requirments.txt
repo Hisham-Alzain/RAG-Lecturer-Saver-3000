@@ -1,0 +1,13 @@
+# Core Dependencies
+streamlit==1.31.0
+sentence-transformers==2.3.1
+chromadb==0.4.22
+python-pptx==0.6.23
+pypdf==3.17.4
+openai==1.12.0
+
+# Supporting Libraries (auto-installed with above, but listed for clarity)
+torch==2.1.2
+transformers==4.37.2
+numpy==1.26.3
+pandas==2.2.0
