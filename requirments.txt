@@ -1,5 +1,7 @@
 streamlit
 sentence-transformers
+torch
+transformers
 chromadb
 python-pptx
 pypdf
