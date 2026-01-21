@@ -40,7 +40,7 @@ class Config:
 
     # Reranking
     ENABLE_RERANKING: bool = True
-    RERANK_MODEL: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    RERANK_MODEL: str = "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1"
     RERANK_CANDIDATES: int = 30
     RERANK_TOP_K: int = 5
 
