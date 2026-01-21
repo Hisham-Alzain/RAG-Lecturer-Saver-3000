@@ -1,0 +1,83 @@
+{
+  "overall": {
+    "hit_rate": 0.0,
+    "recall_at_k": 0.0,
+    "precision_at_k": 0.0,
+    "mrr": 0.0,
+    "faithfulness": 0.0,
+    "answer_relevancy": 0.0,
+    "avg_latency_ms": 3189.947032928467,
+    "cache_hit_rate": 0.2
+  },
+  "arabic": {
+    "hit_rate": 0.0,
+    "recall_at_k": 0.0,
+    "precision_at_k": 0.0,
+    "mrr": 0.0,
+    "faithfulness": 0.0,
+    "answer_relevancy": 0.0,
+    "avg_latency_ms": 2677.1059036254883,
+    "cache_hit_rate": 0.5
+  },
+  "english": {
+    "hit_rate": 0.0,
+    "recall_at_k": 0.0,
+    "precision_at_k": 0.0,
+    "mrr": 0.0,
+    "faithfulness": 0.0,
+    "answer_relevancy": 0.0,
+    "avg_latency_ms": 3531.8411191304526,
+    "cache_hit_rate": 0.0
+  },
+  "num_queries": 5,
+  "num_arabic": 2,
+  "num_english": 3,
+  "timestamp": "2026-01-21T14:07:00.392682",
+  "results": [
+    {
+      "query": "What is RAG and why is it used?",
+      "language": "en",
+      "hit_rate": 0.0,
+      "recall_at_k": 0.0,
+      "faithfulness": 0.0,
+      "answer_relevancy": 0.0,
+      "latency_ms": 4174.636602401733
+    },
+    {
+      "query": "What are the different chunking strategies?",
+      "language": "en",
+      "hit_rate": 0.0,
+      "recall_at_k": 0.0,
+      "faithfulness": 0.0,
+      "answer_relevancy": 0.0,
+      "latency_ms": 3500.685214996338
+    },
+    {
+      "query": "How does hybrid search work?",
+      "language": "en",
+      "hit_rate": 0.0,
+      "recall_at_k": 0.0,
+      "faithfulness": 0.0,
+      "answer_relevancy": 0.0,
+      "latency_ms": 2920.201539993286
+    },
+    {
+      "query": "\u0645\u0627 \u0647\u0648 RAG \u0648\u0644\u0645\u0627\u0630\u0627 \u064a\u0633\u062a\u062e\u062f\u0645\u061f",
+      "language": "ar",
+      "hit_rate": 0.0,
+      "recall_at_k": 0.0,
+      "faithfulness": 0.0,
+      "answer_relevancy": 0.0,
+      "latency_ms": 12.021780014038086
+    },
+    {
+      "query": "\u0645\u0627 \u0647\u064a \u0627\u0633\u062a\u0631\u0627\u062a\u064a\u062c\u064a\u0627\u062a \u062a\u0642\u0633\u064a\u0645 \u0627\u0644\u0646\u0635\u061f",
+      "language": "ar",
+      "hit_rate": 0.0,
+      "recall_at_k": 0.0,
+      "faithfulness": 0.0,
+      "answer_relevancy": 0.0,
+      "latency_ms": 5342.1900272369385
+    }
+  ]
+}

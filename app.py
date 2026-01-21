@@ -1,6 +1,6 @@
 # app.py
 # Enhanced Multilingual RAG Chat - University Tutor
-# Refactored for better organization, Arabic/English support, and maintainability
+# With: True BM25 Hybrid Search, Arabic Morphology, HyDE, MMR, Evaluation, Context Compression
 
 import streamlit as st
 import hashlib
@@ -8,17 +8,38 @@ import uuid
 import re
 import math
 import time
+import json
+import pickle
+from pathlib import Path
 from collections import defaultdict, OrderedDict
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Set
 from dataclasses import dataclass, field
+from datetime import datetime
+import random
 
 # Third-party imports
+import numpy as np
 from sentence_transformers import SentenceTransformer, CrossEncoder
 from chromadb import PersistentClient
 from chromadb.config import Settings
 from pptx import Presentation
 from pypdf import PdfReader
 from openai import OpenAI
+from rank_bm25 import BM25Okapi
+
+# Arabic morphology - graceful fallback if not installed
+try:
+    from camel_tools.morphology.database import MorphologyDB
+    from camel_tools.morphology.analyzer import Analyzer
+    from camel_tools.disambig.mle import MLEDisambiguator
+    from camel_tools.tokenizers.word import simple_word_tokenize
+
+    CAMEL_AVAILABLE = True
+except ImportError:
+    CAMEL_AVAILABLE = False
+    print(
+        "⚠️ camel-tools not installed. Arabic morphology disabled. Install with: pip install camel-tools"
+    )
 
 
 # ============================================================================
@@ -31,18 +52,38 @@ class Config:
     # Chunking
     PARENT_CHUNK_SIZE: int = 1500
     PARENT_OVERLAP: int = 200
-    CHILD_CHUNK_SIZE: int = 512
-    CHILD_OVERLAP: int = 50
+    CHILD_CHUNK_SIZE: int = 950
+    CHILD_OVERLAP: int = 120
 
     # Retrieval
     TOP_K: int = 5
     MULTI_QUERY_COUNT: int = 3
+
+    # BM25
+    ENABLE_BM25: bool = True
+    BM25_WEIGHT: float = 0.4  # Weight for BM25 in hybrid fusion (vector gets 1 - this)
+    BM25_INDEX_PATH: str = "./bm25_index.pkl"
 
     # Reranking
     ENABLE_RERANKING: bool = True
     RERANK_MODEL: str = "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1"
     RERANK_CANDIDATES: int = 30
     RERANK_TOP_K: int = 5
+
+    # MMR (Maximal Marginal Relevance)
+    ENABLE_MMR: bool = True
+    MMR_LAMBDA: float = 0.7  # Balance: 1.0 = pure relevance, 0.0 = pure diversity
+    MMR_TOP_K: int = 5
+
+    # HyDE (Hypothetical Document Embedding)
+    ENABLE_HYDE: bool = True
+
+    # Context Compression
+    ENABLE_CONTEXT_COMPRESSION: bool = True
+    COMPRESSION_MAX_SENTENCES: int = 5
+
+    # Arabic Morphology
+    ENABLE_ARABIC_MORPHOLOGY: bool = True and CAMEL_AVAILABLE
 
     # Semantic Cache
     ENABLE_SEMANTIC_CACHE: bool = True
@@ -54,6 +95,10 @@ class Config:
     CRAG_MIN_MAX_RELEVANCE: float = 0.35
     CRAG_MIN_MEAN_TOP3: float = 0.28
     CRAG_RETRIEVE_EXPANSION: int = 4
+
+    # Evaluation
+    EVAL_DATASET_PATH: str = "./eval_dataset.json"
+    EVAL_RESULTS_PATH: str = "./eval_results.json"
 
     # Paths and Models
     CHROMA_DIR: str = "./chroma_db"
@@ -72,6 +117,13 @@ LLM_PROVIDERS = {
         "get_key_url": "https://console.groq.com/keys",
         "notes": "Fastest inference, 14,400 req/day free",
     },
+    "Groq (Llama 3.1 8B) 🆓": {
+        "base_url": "https://api.groq.com/openai/v1",
+        "model": "llama-3.1-8b-instant",
+        "name": "Groq",
+        "get_key_url": "https://console.groq.com/keys",
+        "notes": "Fast & lightweight, good for testing",
+    },
     "Cerebras (Llama 3.3 70B) 🚀": {
         "base_url": "https://api.cerebras.ai/v1",
         "model": "llama-3.3-70b",
@@ -79,26 +131,19 @@ LLM_PROVIDERS = {
         "get_key_url": "https://cloud.cerebras.ai/",
         "notes": "~1000 tok/sec, very fast",
     },
-    "Groq (Llama 4 Scout) 🆕": {
-        "base_url": "https://api.groq.com/openai/v1",
-        "model": "meta-llama/llama-4-scout-17b-16e-instruct",
-        "name": "Groq",
-        "get_key_url": "https://console.groq.com/keys",
-        "notes": "Latest Llama 4, multimodal capable",
-    },
     "OpenRouter (Llama 3.1 8B) 🆓": {
         "base_url": "https://openrouter.ai/api/v1",
         "model": "meta-llama/llama-3.1-8b-instruct:free",
         "name": "OpenRouter",
         "get_key_url": "https://openrouter.ai/keys",
-        "notes": "30+ free models available",
+        "notes": "Free tier, requires OpenRouter key",
     },
-    "OpenRouter (DeepSeek R1) 🧠": {
+    "OpenRouter (Mistral 7B) 🆓": {
         "base_url": "https://openrouter.ai/api/v1",
-        "model": "deepseek/deepseek-r1-0528:free",
+        "model": "mistralai/mistral-7b-instruct:free",
         "name": "OpenRouter",
         "get_key_url": "https://openrouter.ai/keys",
-        "notes": "Strong reasoning model",
+        "notes": "Free tier, fast responses",
     },
 }
 
@@ -236,6 +281,27 @@ CUSTOM_CSS = """
         font-size: 0.75rem;
         font-weight: 500;
     }
+    
+    .eval-metric {
+        background: #f0f4ff;
+        border: 1px solid #d0d8ff;
+        border-radius: 0.5rem;
+        padding: 0.5rem 1rem;
+        margin: 0.25rem;
+        display: inline-block;
+    }
+    
+    .eval-metric-name {
+        font-size: 0.75rem;
+        color: #666;
+        text-transform: uppercase;
+    }
+    
+    .eval-metric-value {
+        font-size: 1.25rem;
+        font-weight: 600;
+        color: #333;
+    }
 </style>
 """
 st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
@@ -251,6 +317,10 @@ def init_session_state():
         "api_key": "",
         "selected_provider": list(LLM_PROVIDERS.keys())[0],
         "semantic_cache": OrderedDict(),
+        "bm25_index": None,
+        "bm25_corpus": [],
+        "bm25_doc_ids": [],
+        "arabic_analyzer": None,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -258,6 +328,151 @@ def init_session_state():
 
 
 init_session_state()
+
+
+# ============================================================================
+# ARABIC MORPHOLOGY PROCESSOR
+# ============================================================================
+class ArabicMorphologyProcessor:
+    """
+    Handles Arabic text normalization and lemmatization using CAMeL Tools.
+
+    Arabic is morphologically complex - words have roots, patterns, prefixes, and suffixes.
+    For example: يكتبون (they write), كتاب (book), مكتوب (written) all share root ك-ت-ب.
+    Lemmatization helps match these related forms during retrieval.
+    """
+
+    def __init__(self):
+        self.analyzer = None
+        self.disambiguator = None
+        self._initialized = False
+
+    def initialize(self):
+        """Lazy initialization of CAMeL tools (they're heavy to load)."""
+        if self._initialized or not CAMEL_AVAILABLE:
+            return
+
+        try:
+            # Load the morphology database and analyzer
+            db = MorphologyDB.builtin_db()
+            self.analyzer = Analyzer(db)
+            self.disambiguator = MLEDisambiguator.pretrained()
+            self._initialized = True
+        except Exception as e:
+            print(f"Failed to initialize Arabic morphology: {e}")
+            self._initialized = False
+
+    def normalize_arabic(self, text: str) -> str:
+        """
+        Normalize Arabic text for consistent matching.
+
+        This handles common variations in Arabic writing:
+        - Alef variants (أ إ آ ا) -> ا
+        - Teh marbuta (ة) -> ه
+        - Tatweel/kashida (ـ) removal
+        - Diacritics (tashkeel) removal
+        """
+        if not text:
+            return text
+
+        # Normalize Alef variants
+        text = re.sub(r"[أإآٱ]", "ا", text)
+
+        # Normalize Alef Maksura
+        text = re.sub(r"ى", "ي", text)
+
+        # Normalize Teh Marbuta (optional - sometimes you want to keep it)
+        # text = re.sub(r'ة', 'ه', text)
+
+        # Remove Tatweel (elongation character)
+        text = re.sub(r"ـ", "", text)
+
+        # Remove diacritics (tashkeel)
+        arabic_diacritics = re.compile(r"[\u064B-\u065F\u0670]")
+        text = arabic_diacritics.sub("", text)
+
+        return text
+
+    def lemmatize(self, text: str) -> str:
+        """
+        Lemmatize Arabic text to get base forms.
+
+        This converts inflected forms to their lemmas (dictionary forms),
+        which dramatically improves recall for Arabic queries.
+        """
+        if not CAMEL_AVAILABLE or not self._initialized:
+            return self.normalize_arabic(text)
+
+        try:
+            # Tokenize the text
+            tokens = simple_word_tokenize(text)
+
+            # Disambiguate and get lemmas
+            disambiguated = self.disambiguator.disambiguate(tokens)
+
+            lemmas = []
+            for d in disambiguated:
+                # Get the best analysis
+                if d.analyses:
+                    # Use the lemma from the top analysis
+                    lemma = d.analyses[0].analysis.get("lex", d.word)
+                    lemmas.append(lemma)
+                else:
+                    lemmas.append(d.word)
+
+            return " ".join(lemmas)
+        except Exception as e:
+            # Fallback to normalization only
+            return self.normalize_arabic(text)
+
+    def tokenize_for_bm25(self, text: str) -> List[str]:
+        """
+        Tokenize and lemmatize text for BM25 indexing.
+
+        Returns a list of normalized/lemmatized tokens suitable for BM25.
+        """
+        lang = LanguageUtils.detect_language(text)
+
+        if lang == "ar":
+            # Normalize first
+            normalized = self.normalize_arabic(text)
+
+            # Lemmatize if available
+            if self._initialized:
+                processed = self.lemmatize(normalized)
+            else:
+                processed = normalized
+
+            # Tokenize
+            if CAMEL_AVAILABLE:
+                tokens = simple_word_tokenize(processed)
+            else:
+                tokens = re.findall(r"[\u0600-\u06ff]+", processed)
+
+            # Remove stop words
+            stop_words = LanguageUtils.ARABIC_STOP_WORDS
+            tokens = [t for t in tokens if t not in stop_words and len(t) > 1]
+        else:
+            # English tokenization
+            tokens = re.findall(r"\b\w+\b", text.lower())
+            stop_words = LanguageUtils.ENGLISH_STOP_WORDS
+            tokens = [t for t in tokens if t not in stop_words and len(t) > 2]
+
+        return tokens
+
+
+# Global Arabic processor instance
+_arabic_processor = None
+
+
+def get_arabic_processor() -> ArabicMorphologyProcessor:
+    """Get or create the Arabic morphology processor."""
+    global _arabic_processor
+    if _arabic_processor is None:
+        _arabic_processor = ArabicMorphologyProcessor()
+        if CONFIG.ENABLE_ARABIC_MORPHOLOGY:
+            _arabic_processor.initialize()
+    return _arabic_processor
 
 
 # ============================================================================
@@ -320,6 +535,15 @@ class LanguageUtils:
         "قبل",
         "فوق",
         "تحت",
+        "ال",
+        "الى",
+        "عن",
+        "هل",
+        "كيف",
+        "لماذا",
+        "متى",
+        "أين",
+        "من",
     }
 
     # English stop words
@@ -417,23 +641,95 @@ class MathUtils:
         """Compute cosine similarity (assumes normalized vectors)."""
         return float(sum(x * y for x, y in zip(a, b)))
 
+    @staticmethod
+    def cosine_sim_matrix(embeddings: np.ndarray) -> np.ndarray:
+        """Compute pairwise cosine similarity matrix."""
+        # Normalize embeddings
+        norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+        normalized = embeddings / (norms + 1e-10)
+        # Compute similarity matrix
+        return np.dot(normalized, normalized.T)
+
 
 # ============================================================================
 # LLM CLIENT
 # ============================================================================
 class LLMClient:
-    """Wrapper for LLM API interactions."""
+    """Wrapper for LLM API interactions with proper provider-specific handling."""
 
     def __init__(self, provider_key: str, api_key: str):
         config = LLM_PROVIDERS[provider_key]
-        self.client = OpenAI(base_url=config["base_url"], api_key=api_key)
         self.model = config["model"]
         self.provider_name = config["name"]
+        self.provider_key = provider_key
+
+        # Build default headers - OpenRouter requires these additional headers
+        default_headers = {}
+        if "openrouter" in config["base_url"].lower():
+            default_headers = {
+                "HTTP-Referer": "https://university-tutor-rag.streamlit.app",  # Required by OpenRouter
+                "X-Title": "University Tutor RAG",  # Optional but recommended
+            }
+
+        self.client = OpenAI(
+            base_url=config["base_url"],
+            api_key=api_key,
+            default_headers=default_headers if default_headers else None,
+        )
+
+    def test_connection(self) -> Tuple[bool, str]:
+        """
+        Test if the API connection works.
+        Returns (success: bool, message: str)
+        """
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[{"role": "user", "content": "Hi"}],
+                max_tokens=5,
+            )
+            return True, "Connection successful"
+        except Exception as e:
+            error_msg = str(e)
+
+            # Provide helpful error messages based on common issues
+            if "403" in error_msg:
+                if "openrouter" in self.provider_key.lower():
+                    return (
+                        False,
+                        "403 Error: Check that your OpenRouter API key is valid and has credits.",
+                    )
+                elif "groq" in self.provider_key.lower():
+                    return (
+                        False,
+                        "403 Error: Check that your Groq API key is valid. Get one at console.groq.com/keys",
+                    )
+                elif "cerebras" in self.provider_key.lower():
+                    return (
+                        False,
+                        "403 Error: Check that your Cerebras API key is valid.",
+                    )
+                else:
+                    return (
+                        False,
+                        f"403 Error: Access denied. Verify your API key matches the selected provider ({self.provider_name}).",
+                    )
+            elif "401" in error_msg:
+                return False, "401 Error: Invalid API key. Please check your key."
+            elif "429" in error_msg:
+                return False, "429 Error: Rate limited. Wait a moment and try again."
+            elif "model" in error_msg.lower() and "not found" in error_msg.lower():
+                return (
+                    False,
+                    f"Model '{self.model}' not found. The model may have been renamed or is not available.",
+                )
+            else:
+                return False, f"Connection error: {error_msg}"
 
     def chat(
         self, messages: List[Dict], temperature: float = 0.7, max_tokens: int = 2048
     ) -> str:
-        """Send chat completion request."""
+        """Send chat completion request with improved error handling."""
         try:
             response = self.client.chat.completions.create(
                 model=self.model,
@@ -443,7 +739,19 @@ class LLMClient:
             )
             return response.choices[0].message.content
         except Exception as e:
-            return f"Error: {str(e)}"
+            error_msg = str(e)
+
+            # Provide more helpful error messages
+            if "403" in error_msg:
+                return f"Error: Access denied (403). Please verify:\n1. Your API key is correct\n2. The key matches the selected provider ({self.provider_name})\n3. Your account has available credits/quota"
+            elif "401" in error_msg:
+                return "Error: Invalid API key (401). Please check your API key."
+            elif "429" in error_msg:
+                return "Error: Rate limited (429). Please wait a moment and try again."
+            elif "model" in error_msg.lower():
+                return f"Error: Model issue - {error_msg}. Try selecting a different provider."
+            else:
+                return f"Error: {error_msg}"
 
     def translate_query(self, query: str, source_lang: str) -> Optional[str]:
         """Translate query to the other language for bilingual search."""
@@ -515,6 +823,72 @@ Output ONLY the questions, one per line, without numbering."""
             st.warning(f"Multi-query generation failed: {e}")
             return []
 
+    def generate_hypothetical_answer(
+        self, query: str, question_lang: str
+    ) -> Optional[str]:
+        """
+        Generate a hypothetical answer for HyDE (Hypothetical Document Embedding).
+
+        HyDE works by generating what a good answer WOULD look like, then embedding
+        that hypothetical answer to search for similar real documents. This bridges
+        the gap between question-style text and document-style text.
+        """
+        if question_lang == "ar":
+            instruction = """أنت مساعد أكاديمي. اكتب فقرة قصيرة (3-4 جمل) تجيب على هذا السؤال كما لو كانت من مادة محاضرة.
+اكتب بأسلوب أكاديمي موضوعي. لا تقل "السؤال هو" أو "الجواب هو".
+اكتب المحتوى مباشرة كما يظهر في كتاب أو محاضرة."""
+        else:
+            instruction = """You are an academic assistant. Write a short paragraph (3-4 sentences) answering this question as if from lecture material.
+Write in objective academic style. Don't say "The question is" or "The answer is".
+Write the content directly as it would appear in a textbook or lecture."""
+
+        try:
+            result = self.chat(
+                [{"role": "user", "content": f"{instruction}\n\nQuestion: {query}"}],
+                temperature=0.5,
+                max_tokens=256,
+            )
+            if result and not result.startswith("Error:"):
+                return result.strip()
+        except Exception:
+            pass
+        return None
+
+    def compress_context(
+        self, query: str, context: str, question_lang: str, max_sentences: int = 5
+    ) -> str:
+        """
+        Compress context by extracting only the most relevant sentences.
+
+        This reduces noise in the context sent to the generator, improving
+        answer quality and reducing hallucination.
+        """
+        if question_lang == "ar":
+            instruction = f"""استخرج أهم {max_sentences} جمل من النص التالي التي تجيب مباشرة على السؤال.
+اكتب الجمل فقط، كل جملة في سطر منفصل.
+إذا لم تجد معلومات ذات صلة، اكتب "لا توجد معلومات ذات صلة"."""
+        else:
+            instruction = f"""Extract the {max_sentences} most important sentences from the following text that directly answer the question.
+Write only the sentences, one per line.
+If no relevant information found, write "No relevant information found"."""
+
+        try:
+            result = self.chat(
+                [
+                    {
+                        "role": "user",
+                        "content": f"{instruction}\n\nQuestion: {query}\n\nText:\n{context}",
+                    }
+                ],
+                temperature=0.3,
+                max_tokens=512,
+            )
+            if result and not result.startswith("Error:"):
+                return result.strip()
+        except Exception:
+            pass
+        return context  # Return original if compression fails
+
 
 # ============================================================================
 # MODEL LOADERS (Cached)
@@ -532,16 +906,156 @@ def load_reranker() -> CrossEncoder:
 
 
 def get_chroma_collection():
-    """Get or create ChromaDB collection."""
+    """Get or create ChromaDB collection (cosine space for normalized embeddings)."""
     if "chroma_collection" not in st.session_state:
         chroma_client = PersistentClient(
             path=CONFIG.CHROMA_DIR, settings=Settings(allow_reset=True)
         )
         st.session_state["chroma_client"] = chroma_client
+
+        # IMPORTANT: cosine distance (works with normalize_embeddings=True)
         st.session_state["chroma_collection"] = chroma_client.get_or_create_collection(
-            "lecture_rag"
+            "lecture_rag",
+            metadata={"hnsw:space": "cosine"},
         )
     return st.session_state["chroma_client"], st.session_state["chroma_collection"]
+
+
+# ============================================================================
+# BM25 INDEX MANAGER
+# ============================================================================
+class BM25IndexManager:
+    """
+    Manages the BM25 sparse retrieval index.
+
+    BM25 (Best Match 25) is a bag-of-words retrieval function that ranks documents
+    based on term frequency and inverse document frequency. It excels at exact
+    keyword matching, which complements vector search's semantic matching.
+
+    This is crucial for Arabic because:
+    1. Technical terms and proper nouns often don't embed well
+    2. Exact matches for transliterated terms (e.g., "CNN", "BERT") are important
+    3. Arabic morphological variants can be pre-processed for better matching
+    """
+
+    def __init__(self):
+        self.index: Optional[BM25Okapi] = None
+        self.corpus: List[List[str]] = []  # Tokenized documents
+        self.doc_ids: List[str] = []  # Corresponding document IDs
+        self.raw_texts: List[str] = []  # Original texts for reference
+        self.arabic_processor = get_arabic_processor()
+
+    def tokenize_document(self, text: str) -> List[str]:
+        """Tokenize a document for BM25 indexing with Arabic morphology support."""
+        return self.arabic_processor.tokenize_for_bm25(text)
+
+    def build_index(self, documents: List[Dict]):
+        """
+        Build BM25 index from a list of documents.
+
+        Each document should have 'id' and 'text' keys.
+        """
+        self.corpus = []
+        self.doc_ids = []
+        self.raw_texts = []
+
+        for doc in documents:
+            doc_id = doc.get("id", str(uuid.uuid4()))
+            text = doc.get("text", "")
+
+            tokens = self.tokenize_document(text)
+
+            if tokens:  # Only add if we have tokens
+                self.corpus.append(tokens)
+                self.doc_ids.append(doc_id)
+                self.raw_texts.append(text)
+
+        if self.corpus:
+            self.index = BM25Okapi(self.corpus)
+
+    def add_documents(self, documents: List[Dict]):
+        """Add new documents to the existing index."""
+        for doc in documents:
+            doc_id = doc.get("id", str(uuid.uuid4()))
+            text = doc.get("text", "")
+
+            tokens = self.tokenize_document(text)
+
+            if tokens:
+                self.corpus.append(tokens)
+                self.doc_ids.append(doc_id)
+                self.raw_texts.append(text)
+
+        # Rebuild index with new documents
+        if self.corpus:
+            self.index = BM25Okapi(self.corpus)
+
+    def search(self, query: str, top_k: int = 10) -> List[Tuple[str, float]]:
+        """
+        Search the BM25 index and return top-k results.
+
+        Returns list of (doc_id, score) tuples.
+        """
+        if not self.index or not self.corpus:
+            return []
+
+        # Tokenize query with same preprocessing as documents
+        query_tokens = self.tokenize_document(query)
+
+        if not query_tokens:
+            return []
+
+        # Get BM25 scores for all documents
+        scores = self.index.get_scores(query_tokens)
+
+        # Get top-k indices
+        top_indices = np.argsort(scores)[::-1][:top_k]
+
+        results = []
+        for idx in top_indices:
+            if scores[idx] > 0:  # Only include documents with positive scores
+                results.append((self.doc_ids[idx], float(scores[idx])))
+
+        return results
+
+    def save(self, path: str):
+        """Save the BM25 index to disk."""
+        data = {
+            "corpus": self.corpus,
+            "doc_ids": self.doc_ids,
+            "raw_texts": self.raw_texts,
+        }
+        with open(path, "wb") as f:
+            pickle.dump(data, f)
+
+    def load(self, path: str) -> bool:
+        """Load the BM25 index from disk."""
+        try:
+            with open(path, "rb") as f:
+                data = pickle.load(f)
+
+            self.corpus = data["corpus"]
+            self.doc_ids = data["doc_ids"]
+            self.raw_texts = data.get("raw_texts", [])
+
+            if self.corpus:
+                self.index = BM25Okapi(self.corpus)
+            return True
+        except Exception as e:
+            print(f"Failed to load BM25 index: {e}")
+            return False
+
+
+# Global BM25 manager
+def get_bm25_manager() -> BM25IndexManager:
+    """Get or create the BM25 index manager."""
+    if "bm25_manager" not in st.session_state:
+        manager = BM25IndexManager()
+        # Try to load existing index
+        if Path(CONFIG.BM25_INDEX_PATH).exists():
+            manager.load(CONFIG.BM25_INDEX_PATH)
+        st.session_state["bm25_manager"] = manager
+    return st.session_state["bm25_manager"]
 
 
 # ============================================================================
@@ -596,59 +1110,58 @@ class DocumentProcessor:
     def split_text_recursive(
         self, text: str, max_size: int, overlap: int, separators: List[str]
     ) -> List[str]:
-        """Recursively split text into chunks."""
-        if self.get_token_count(text) <= max_size:
+        """
+        Character-based recursive splitter.
+
+        max_size/overlap are in CHARACTERS (matches homework "500-1000 chars").
+        """
+        text = (text or "").strip()
+        if not text:
+            return []
+
+        if len(text) <= max_size:
             return [text]
 
         for sep in separators:
-            if sep in text:
+            if sep and sep in text:
                 parts = text.split(sep)
                 chunks = []
-                current_chunk = ""
+                current = ""
 
                 for i, part in enumerate(parts):
-                    if sep and i > 0:
+                    if i > 0:
                         part = sep + part
 
-                    test_chunk = current_chunk + part
-                    if self.get_token_count(test_chunk) <= max_size:
-                        current_chunk = test_chunk
+                    candidate = current + part
+                    if len(candidate) <= max_size:
+                        current = candidate
                     else:
-                        if current_chunk:
-                            chunks.append(current_chunk)
+                        if current:
+                            chunks.append(current.strip())
 
-                        if overlap > 0 and chunks:
-                            words = current_chunk.split()
-                            overlap_text = " ".join(words[-overlap:])
-                            current_chunk = overlap_text + part
+                        # overlap in characters
+                        if overlap > 0 and current:
+                            tail = current[-overlap:]
+                            current = (tail + part).strip()
                         else:
-                            current_chunk = part
+                            current = part.strip()
 
-                if current_chunk:
-                    chunks.append(current_chunk)
+                if current:
+                    chunks.append(current.strip())
 
+                # If split worked into >1 chunk, stop here
                 if len(chunks) > 1:
                     return chunks
 
-        # Force split by words
-        words = text.split()
-        chunks = []
-        current = []
-        current_tokens = 0
+        # Fallback: sliding window char split
+        step = max(1, max_size - overlap)
+        out = []
+        for start in range(0, len(text), step):
+            out.append(text[start : start + max_size].strip())
+            if start + max_size >= len(text):
+                break
+        return [c for c in out if c]
 
-        for word in words:
-            word_tokens = self.get_token_count(word)
-            if current_tokens + word_tokens > max_size and current:
-                chunks.append(" ".join(current))
-                current = current[-overlap:] if overlap > 0 else []
-                current_tokens = sum(self.get_token_count(w) for w in current)
-            current.append(word)
-            current_tokens += word_tokens
-
-        if current:
-            chunks.append(" ".join(current))
-
-        return chunks if chunks else [text]
 
     def hierarchical_chunk_text(self, text: str, metadata: Dict) -> List[Dict]:
         """Create hierarchical parent-child chunks."""
@@ -672,12 +1185,9 @@ class DocumentProcessor:
 
             for child_idx, child_text in enumerate(child_chunks):
                 # Add context prefix for better embeddings
-                context_prefix = f"""Document: {metadata['source']}
-Page: {metadata['page']}
-Type: {metadata['type']}
-Language: {metadata['lang']}
+                context_prefix = f"[{metadata['source']} | page {metadata['page']}]\n"
 
-"""
+
                 child_with_context = context_prefix + child_text
 
                 all_chunks.append(
@@ -699,12 +1209,13 @@ Language: {metadata['lang']}
 
 
 class DocumentIngester:
-    """Handle document ingestion into the vector database."""
+    """Handle document ingestion into both vector database and BM25 index."""
 
     def __init__(self, embedder: SentenceTransformer, collection):
         self.embedder = embedder
         self.collection = collection
         self.processor = DocumentProcessor(embedder)
+        self.bm25_manager = get_bm25_manager()
 
     @staticmethod
     def get_file_hash(file) -> str:
@@ -723,7 +1234,7 @@ class DocumentIngester:
             return False
 
     def ingest(self, file) -> Tuple[int, str]:
-        """Ingest a document into the vector database."""
+        """Ingest a document into both vector database and BM25 index."""
         file_hash = self.get_file_hash(file)
 
         if self.file_already_ingested(file_hash):
@@ -744,6 +1255,7 @@ class DocumentIngester:
 
         all_chunks = []
         chunk_metadata = []
+        bm25_docs = []  # Documents for BM25 indexing
 
         for page_num, text in pages:
             chunk_lang = LanguageUtils.detect_language(text)
@@ -760,9 +1272,12 @@ class DocumentIngester:
             )
 
             for chunk_data in chunks:
+                base = f"{file_hash}|{file.name}|p{page_num}|pa{chunk_data['metadata']['parent_idx']}|ch{chunk_data['metadata']['child_idx']}"
+                chunk_id = hashlib.md5(base.encode("utf-8")).hexdigest()
                 all_chunks.append(f"passage: {chunk_data['child_text']}")
                 chunk_metadata.append(
                     {
+                        "id": chunk_id,
                         "child_text": chunk_data["child_text"],
                         "child_text_raw": chunk_data["child_text_raw"],
                         "parent_text": chunk_data["parent_text"],
@@ -771,16 +1286,26 @@ class DocumentIngester:
                     }
                 )
 
+                # Prepare document for BM25 - use parent text for richer context
+                bm25_docs.append(
+                    {
+                        "id": chunk_id,
+                        "text": chunk_data["child_text_raw"],
+                    }
+                )
+
         if not all_chunks:
             return 0, "no chunks"
 
         try:
+            # Generate embeddings for vector store
             embeddings = self.embedder.encode(
                 all_chunks, normalize_embeddings=True, show_progress_bar=False
             ).tolist()
 
+            # Add to ChromaDB
             self.collection.add(
-                ids=[str(uuid.uuid4()) for _ in all_chunks],
+                ids=[m["id"] for m in chunk_metadata],
                 documents=[m["child_text_raw"] for m in chunk_metadata],
                 embeddings=embeddings,
                 metadatas=[
@@ -799,6 +1324,12 @@ class DocumentIngester:
                     for m in chunk_metadata
                 ],
             )
+
+            # Add to BM25 index
+            if CONFIG.ENABLE_BM25:
+                self.bm25_manager.add_documents(bm25_docs)
+                self.bm25_manager.save(CONFIG.BM25_INDEX_PATH)
+
             return len(all_chunks), "success"
         except Exception as e:
             return 0, str(e)
@@ -808,7 +1339,18 @@ class DocumentIngester:
 # RETRIEVAL SYSTEM
 # ============================================================================
 class Retriever:
-    """Handle document retrieval with hybrid search and reranking."""
+    """
+    Handle document retrieval with true hybrid search, HyDE, reranking, and MMR.
+
+    The retrieval pipeline:
+    1. Multi-query generation (semantic + keyword variations)
+    2. Cross-lingual translation (Arabic <-> English)
+    3. HyDE (Hypothetical Document Embedding) for abstract queries
+    4. Hybrid search (Vector + BM25 with RRF fusion)
+    5. Cross-encoder reranking
+    6. MMR diversity filtering
+    7. CRAG quality assessment
+    """
 
     def __init__(
         self, embedder: SentenceTransformer, collection, llm_client: LLMClient
@@ -817,6 +1359,7 @@ class Retriever:
         self.collection = collection
         self.llm_client = llm_client
         self.reranker = None
+        self.bm25_manager = get_bm25_manager()
 
         if CONFIG.ENABLE_RERANKING or CONFIG.ENABLE_CRAG:
             try:
@@ -825,22 +1368,14 @@ class Retriever:
                 st.warning(f"Reranker failed to load: {e}")
 
     def extract_keywords(self, text: str, max_keywords: int = 5) -> List[str]:
-        """Extract keywords from text."""
-        lang = LanguageUtils.detect_language(text)
-        stop_words = LanguageUtils.get_stop_words(lang)
-
-        # Tokenize based on language
-        if lang == "ar":
-            words = re.findall(r"[\u0600-\u06ff]+|\b\w+\b", text.lower())
-        else:
-            words = re.findall(r"\b\w+\b", text.lower())
-
-        keywords = [w for w in words if w not in stop_words and len(w) > 2]
+        """Extract keywords from text with Arabic morphology support."""
+        arabic_processor = get_arabic_processor()
+        tokens = arabic_processor.tokenize_for_bm25(text)
 
         # Return unique keywords
         seen = set()
         unique_keywords = []
-        for kw in keywords:
+        for kw in tokens:
             if kw not in seen:
                 seen.add(kw)
                 unique_keywords.append(kw)
@@ -849,85 +1384,202 @@ class Retriever:
 
         return unique_keywords
 
-    def reciprocal_rank_fusion(self, results_list: List, k: int = 60) -> List[Dict]:
-        """Combine multiple ranked lists using Reciprocal Rank Fusion."""
+    def vector_search(self, query: str, top_k: int = 10) -> List[Dict]:
+        """Perform vector similarity search."""
+        query_embedding = self.embedder.encode(
+            [f"query: {query}"], normalize_embeddings=True
+        ).tolist()
+
+        results = self.collection.query(
+            query_embeddings=query_embedding, n_results=top_k
+        )
+
+        if not results["ids"] or not results["ids"][0]:
+            return []
+
+        return [
+            {
+                "id": doc_id,
+                "score": max(0.0, 1.0 - float(dist)),  # Convert distance to similarity
+                "metadata": meta,
+                "document": doc,
+                "distance": dist,
+            }
+            for doc_id, dist, meta, doc in zip(
+                results["ids"][0],
+                results["distances"][0],
+                results["metadatas"][0],
+                results["documents"][0],
+            )
+        ]
+
+    def bm25_search(self, query: str, top_k: int = 10) -> List[Dict]:
+        """
+        Perform BM25 sparse retrieval search.
+
+        This catches exact term matches that vector search might miss,
+        especially important for:
+        - Technical terms and acronyms (CNN, BERT, API)
+        - Arabic proper nouns and transliterations
+        - Exact keyword matches
+        """
+        if not CONFIG.ENABLE_BM25 or not self.bm25_manager.index:
+            return []
+
+        bm25_results = self.bm25_manager.search(query, top_k=top_k)
+
+        if not bm25_results:
+            return []
+
+        # Fetch full document info from ChromaDB
+        doc_ids = [doc_id for doc_id, _ in bm25_results]
+        scores = {doc_id: score for doc_id, score in bm25_results}
+
+        try:
+            chroma_results = self.collection.get(
+                ids=doc_ids, include=["documents", "metadatas"]
+            )
+
+            results = []
+            for doc_id, doc, meta in zip(
+                chroma_results["ids"],
+                chroma_results["documents"],
+                chroma_results["metadatas"],
+            ):
+                results.append(
+                    {
+                        "id": doc_id,
+                        "score": scores.get(doc_id, 0.0),
+                        "metadata": meta,
+                        "document": doc,
+                        "source": "bm25",
+                    }
+                )
+            return results
+        except Exception:
+            return []
+
+    def reciprocal_rank_fusion(
+        self, results_lists: List[List[Dict]], k: int = 60
+    ) -> List[Dict]:
+        """
+        Combine multiple ranked lists using Reciprocal Rank Fusion (RRF).
+
+        RRF is a simple but effective fusion method that:
+        - Doesn't require score normalization
+        - Handles different score distributions well
+        - Balances precision and recall
+
+        Formula: RRF_score(d) = Σ 1/(k + rank_i(d))
+        where k is a constant (typically 60) that dampens the impact of rank differences.
+        """
         scores = defaultdict(float)
         doc_data = {}
 
-        for results in results_list:
-            if not results or "ids" not in results or not results["ids"]:
-                continue
-
-            for rank, (doc_id, distance, metadata, document) in enumerate(
-                zip(
-                    results["ids"][0],
-                    results["distances"][0],
-                    results["metadatas"][0],
-                    results["documents"][0],
-                )
-            ):
+        for results in results_lists:
+            for rank, result in enumerate(results):
+                doc_id = result["id"]
                 scores[doc_id] += 1.0 / (k + rank + 1)
+
                 if doc_id not in doc_data:
-                    doc_data[doc_id] = {
-                        "metadata": metadata,
-                        "document": document,
-                        "distance": distance,
-                    }
+                    doc_data[doc_id] = result
 
         sorted_docs = sorted(scores.items(), key=lambda x: x[1], reverse=True)
 
         return [
-            {"id": doc_id, "score": score, **doc_data[doc_id]}
+            {**doc_data[doc_id], "rrf_score": score}
             for doc_id, score in sorted_docs
+            if doc_id in doc_data
         ]
 
-    def hybrid_retrieve(self, question: str, top_k: int = 5) -> List[Dict]:
-        """Perform hybrid search combining vector and keyword search."""
-        question_embedding = self.embedder.encode(
-            [f"query: {question}"], normalize_embeddings=True
-        ).tolist()
+    def hybrid_retrieve(self, question: str, top_k: int = 10) -> List[Dict]:
+        """
+        Perform true hybrid search combining vector and BM25 retrieval.
+
+        This addresses the limitation of the original implementation where
+        "hybrid search" was just vector search with keyword filtering.
+        True hybrid search runs both retrieval methods independently and
+        fuses their results using RRF.
+        """
+        results_lists = []
 
         # Vector search
-        vector_results = self.collection.query(
-            query_embeddings=question_embedding, n_results=top_k * 3
-        )
+        vector_results = self.vector_search(question, top_k=top_k)
+        if vector_results:
+            results_lists.append(vector_results)
 
-        # Keyword search
-        keywords = self.extract_keywords(question)
-        keyword_results = None
+        # BM25 search
+        if CONFIG.ENABLE_BM25:
+            bm25_results = self.bm25_search(question, top_k=top_k)
+            if bm25_results:
+                results_lists.append(bm25_results)
 
-        if keywords:
-            try:
-                keyword_query = " ".join(keywords)
-                keyword_results = self.collection.query(
-                    query_embeddings=question_embedding,
-                    n_results=top_k * 3,
-                    where_document={"$contains": keyword_query},
-                )
-            except Exception:
-                keyword_results = None
-
-        # Fusion
-        if keyword_results and keyword_results["ids"] and keyword_results["ids"][0]:
-            fused = self.reciprocal_rank_fusion([vector_results, keyword_results])
+        # Fuse results
+        if len(results_lists) > 1:
+            fused = self.reciprocal_rank_fusion(results_lists)
+        elif results_lists:
+            fused = results_lists[0]
         else:
-            fused = [
-                {
-                    "id": doc_id,
-                    "score": 1.0 / (1 + dist),
-                    "metadata": meta,
-                    "document": doc,
-                    "distance": dist,
-                }
-                for doc_id, dist, meta, doc in zip(
-                    vector_results["ids"][0],
-                    vector_results["distances"][0],
-                    vector_results["metadatas"][0],
-                    vector_results["documents"][0],
-                )
-            ]
+            fused = []
 
         return fused[:top_k]
+
+    def hyde_retrieve(
+        self, question: str, question_lang: str, top_k: int = 10
+    ) -> List[Dict]:
+        """
+        Perform HyDE (Hypothetical Document Embedding) retrieval.
+
+        HyDE generates a hypothetical answer to the question, then uses that
+        answer's embedding to search for similar documents. This works because
+        the hypothetical answer is written in "document style" rather than
+        "question style", bridging the semantic gap.
+
+        Particularly useful for:
+        - Abstract or conceptual questions
+        - Questions that use different vocabulary than the documents
+        - Arabic queries where question phrasing differs from document style
+        """
+        if not CONFIG.ENABLE_HYDE:
+            return []
+
+        # Generate hypothetical answer
+        hypothetical = self.llm_client.generate_hypothetical_answer(
+            question, question_lang
+        )
+
+        if not hypothetical:
+            return []
+
+        # Embed the hypothetical answer (as a passage, not query)
+        hyde_embedding = self.embedder.encode(
+            [f"passage: {hypothetical}"], normalize_embeddings=True
+        ).tolist()
+
+        # Search with the hypothetical embedding
+        results = self.collection.query(
+            query_embeddings=hyde_embedding, n_results=top_k
+        )
+
+        if not results["ids"] or not results["ids"][0]:
+            return []
+
+        return [
+            {
+                "id": doc_id,
+                "score": 1.0 / (1 + dist),
+                "metadata": meta,
+                "document": doc,
+                "distance": dist,
+                "source": "hyde",
+            }
+            for doc_id, dist, meta, doc in zip(
+                results["ids"][0],
+                results["distances"][0],
+                results["metadatas"][0],
+                results["documents"][0],
+            )
+        ]
 
     def dedupe_by_parent(self, results: List[Dict]) -> List[Dict]:
         """Deduplicate results by parent_id."""
@@ -966,7 +1618,11 @@ class Retriever:
 
         pairs = []
         for c in pool:
-            doc_text = c.get("parent_text") or c.get("child_text", "")
+            doc_text = (
+                c.get("parent_text")
+                or c["metadata"].get("parent_text", "")
+                or c.get("document", "")
+            )
             doc_text = self.truncate_for_rerank(doc_text)
             pairs.append([query, doc_text])
 
@@ -982,6 +1638,80 @@ class Retriever:
         reranked_scores = [float(x.get("rerank_score", 0.0)) for x in reranked]
 
         return reranked, reranked_scores
+
+    def apply_mmr(
+        self, query: str, candidates: List[Dict], top_k: int, lambda_param: float = 0.7
+    ) -> List[Dict]:
+        """
+        Apply Maximal Marginal Relevance (MMR) for diversity.
+
+        MMR balances relevance to the query with diversity among selected documents.
+        This prevents returning multiple chunks that say similar things.
+
+        Formula: MMR = λ × sim(q, d) - (1-λ) × max(sim(d, d_selected))
+
+        where:
+        - λ = 1.0 means pure relevance (no diversity)
+        - λ = 0.0 means pure diversity (ignore relevance)
+        - λ = 0.7 (default) balances both
+        """
+        if not CONFIG.ENABLE_MMR or len(candidates) <= top_k:
+            return candidates[:top_k]
+
+        # Get embeddings for query and all candidates
+        query_emb = self.embedder.encode(
+            [f"query: {query}"], normalize_embeddings=True
+        )[0]
+
+        # Get document texts and embed them
+        doc_texts = []
+        for c in candidates:
+            text = (
+                c.get("parent_text")
+                or c["metadata"].get("parent_text", "")
+                or c.get("document", "")
+            )
+            doc_texts.append(f"passage: {text[:1000]}")  # Truncate for efficiency
+
+        doc_embeddings = self.embedder.encode(doc_texts, normalize_embeddings=True)
+
+        # Calculate query-document similarities
+        query_sims = np.dot(doc_embeddings, query_emb)
+
+        # MMR selection
+        selected_indices = []
+        remaining_indices = list(range(len(candidates)))
+
+        while len(selected_indices) < top_k and remaining_indices:
+            best_idx = None
+            best_score = -float("inf")
+
+            for idx in remaining_indices:
+                # Relevance to query
+                relevance = query_sims[idx]
+
+                # Maximum similarity to already selected documents
+                if selected_indices:
+                    selected_embs = doc_embeddings[selected_indices]
+                    candidate_emb = doc_embeddings[idx]
+                    diversity_penalty = np.max(np.dot(selected_embs, candidate_emb))
+                else:
+                    diversity_penalty = 0
+
+                # MMR score
+                mmr_score = (
+                    lambda_param * relevance - (1 - lambda_param) * diversity_penalty
+                )
+
+                if mmr_score > best_score:
+                    best_score = mmr_score
+                    best_idx = idx
+
+            if best_idx is not None:
+                selected_indices.append(best_idx)
+                remaining_indices.remove(best_idx)
+
+        return [candidates[i] for i in selected_indices]
 
     def assess_retrieval_quality(self, rerank_scores: List[float]) -> Dict[str, float]:
         """Assess retrieval quality for CRAG gating."""
@@ -1006,9 +1736,11 @@ class Retriever:
         return False
 
     def retrieve(
-        self, question: str, per_query_k: int = 3, final_k: int = None
+        self, question: str, per_query_k: int = 5, final_k: int = None
     ) -> Tuple[List[Dict], Dict]:
-        """Full retrieval pipeline with multi-query, hybrid search, reranking, and CRAG."""
+        """
+        Full retrieval pipeline with multi-query, HyDE, hybrid search, reranking, MMR, and CRAG.
+        """
         if final_k is None:
             final_k = CONFIG.TOP_K
 
@@ -1016,6 +1748,9 @@ class Retriever:
             "crag_used": False,
             "crag_metrics": None,
             "crag_metrics_after": None,
+            "hyde_used": CONFIG.ENABLE_HYDE,
+            "bm25_used": CONFIG.ENABLE_BM25,
+            "mmr_used": CONFIG.ENABLE_MMR,
         }
 
         question_lang = LanguageUtils.detect_language(question)
@@ -1031,27 +1766,35 @@ class Retriever:
         if translated:
             query_variations.append(translated)
 
-        # Retrieve for each query variation
+        # Collect all results from different retrieval strategies
         all_results = []
+
+        # 1. Hybrid retrieval for each query variation
         for q in query_variations:
             results = self.hybrid_retrieve(q, top_k=per_query_k)
             for result in results:
-                all_results.append(
-                    {
-                        "id": result["id"],
-                        "score": float(result["score"]),
-                        "child_text": result["document"],
-                        "parent_text": result["metadata"].get(
-                            "parent_text", result["document"]
-                        ),
-                        "metadata": result["metadata"],
-                    }
+                result["parent_text"] = result["metadata"].get(
+                    "parent_text", result["document"]
                 )
+                all_results.append(result)
 
-        # Sort and dedupe
-        all_results.sort(key=lambda x: x["score"], reverse=True)
+        # 2. HyDE retrieval (only for original query to save API calls)
+        if CONFIG.ENABLE_HYDE:
+            hyde_results = self.hyde_retrieve(
+                question, question_lang, top_k=per_query_k
+            )
+            for result in hyde_results:
+                result["parent_text"] = result["metadata"].get(
+                    "parent_text", result["document"]
+                )
+                all_results.append(result)
+
+        # Sort by score and deduplicate
+        all_results.sort(
+            key=lambda x: x.get("rrf_score", x.get("score", 0)), reverse=True
+        )
         all_results = self.dedupe_by_parent(all_results)
-        candidates = all_results[: max(final_k, CONFIG.RERANK_CANDIDATES)]
+        candidates = all_results[: max(final_k * 2, CONFIG.RERANK_CANDIDATES)]
 
         # Rerank
         reranked = candidates
@@ -1059,10 +1802,8 @@ class Retriever:
 
         if CONFIG.ENABLE_RERANKING and self.reranker and candidates:
             reranked, rerank_scores = self.rerank(
-                question, candidates, CONFIG.RERANK_TOP_K
+                question, candidates, CONFIG.RERANK_CANDIDATES
             )
-        else:
-            reranked = candidates[:final_k]
 
         # CRAG - Corrective RAG
         if CONFIG.ENABLE_CRAG and self.reranker:
@@ -1084,24 +1825,32 @@ class Retriever:
                         q, top_k=per_query_k * CONFIG.CRAG_RETRIEVE_EXPANSION
                     )
                     for result in results:
-                        expanded_results.append(
-                            {
-                                "id": result["id"],
-                                "score": float(result["score"]),
-                                "child_text": result["document"],
-                                "parent_text": result["metadata"].get(
-                                    "parent_text", result["document"]
-                                ),
-                                "metadata": result["metadata"],
-                            }
+                        result["parent_text"] = result["metadata"].get(
+                            "parent_text", result["document"]
                         )
+                        expanded_results.append(result)
 
-                expanded_results.sort(key=lambda x: x["score"], reverse=True)
+                # Add more HyDE results
+                if CONFIG.ENABLE_HYDE:
+                    hyde_results = self.hyde_retrieve(
+                        question,
+                        question_lang,
+                        top_k=per_query_k * CONFIG.CRAG_RETRIEVE_EXPANSION,
+                    )
+                    for result in hyde_results:
+                        result["parent_text"] = result["metadata"].get(
+                            "parent_text", result["document"]
+                        )
+                        expanded_results.append(result)
+
+                expanded_results.sort(
+                    key=lambda x: x.get("rrf_score", x.get("score", 0)), reverse=True
+                )
                 expanded_results = self.dedupe_by_parent(expanded_results)
 
                 if expanded_results:
                     corrected, corrected_scores = self.rerank(
-                        question, expanded_results, CONFIG.RERANK_TOP_K
+                        question, expanded_results, CONFIG.RERANK_CANDIDATES
                     )
                     corrected_metrics = self.assess_retrieval_quality(corrected_scores)
                     debug["crag_metrics_after"] = corrected_metrics
@@ -1116,6 +1865,17 @@ class Retriever:
                         and corrected_metrics["max_relevance"] < 0.20
                     ):
                         reranked = []
+
+        # Apply MMR for diversity
+        if CONFIG.ENABLE_MMR and reranked:
+            reranked = self.apply_mmr(
+                question,
+                reranked,
+                top_k=CONFIG.MMR_TOP_K,
+                lambda_param=CONFIG.MMR_LAMBDA,
+            )
+        else:
+            reranked = reranked[:final_k]
 
         return reranked, debug
 
@@ -1207,7 +1967,7 @@ class SemanticCache:
 # ANSWER GENERATION
 # ============================================================================
 class AnswerGenerator:
-    """Generate answers with proper citations and language handling."""
+    """Generate answers with proper citations, context compression, and language handling."""
 
     def __init__(self, llm_client: LLMClient):
         self.llm_client = llm_client
@@ -1237,6 +1997,35 @@ class AnswerGenerator:
 
         return cleaned
 
+    def compress_contexts(
+        self, retrieved_docs: List[Dict], question: str, question_lang: str
+    ) -> List[Dict]:
+        """
+        Compress retrieved contexts by extracting only relevant sentences.
+
+        This reduces noise in the context sent to the generator, improving
+        answer quality and reducing hallucination risk.
+        """
+        if not CONFIG.ENABLE_CONTEXT_COMPRESSION:
+            return retrieved_docs
+
+        compressed_docs = []
+        for doc in retrieved_docs:
+            parent_text = doc.get("parent_text", doc.get("document", ""))
+
+            # Compress the context
+            compressed = self.llm_client.compress_context(
+                question, parent_text, question_lang, CONFIG.COMPRESSION_MAX_SENTENCES
+            )
+
+            # Create new doc with compressed text
+            compressed_doc = dict(doc)
+            compressed_doc["original_parent_text"] = parent_text
+            compressed_doc["parent_text"] = compressed
+            compressed_docs.append(compressed_doc)
+
+        return compressed_docs
+
     def get_arabic_system_prompt(self) -> str:
         """Get the system prompt for Arabic responses."""
         return """أنت مدرس جامعي متخصص في مجالات هندسة الذكاء الاصطناعي (الرؤية الحاسوبية، معالجة اللغات الطبيعية، التعلم الآلي).
@@ -1252,10 +2041,9 @@ class AnswerGenerator:
 ═══════════════════════════════════════════════════════════════
 قواعد الاستشهاد - إلزامية
 ═══════════════════════════════════════════════════════════════
-- أضف [رقم] بعد كل معلومة مباشرة
-- مثال: "الرؤية الحاسوبية مجال متعدد التخصصات [1]."
-- لا تذكر معلومات بدون استشهاد
-- إذا لم تجد المعلومة في المصادر، قل: "لا تتوفر هذه المعلومة في المواد المتاحة"
+- Use citations like [1], [2], ... that refer to the provided sources.
+- Cite each major claim (1–2 citations per paragraph is fine).
+- Do not invent sources. If not found, say it’s not in the materials.
 
 ═══════════════════════════════════════════════════════════════
 تنسيق الإجابة
@@ -1272,10 +2060,10 @@ class AnswerGenerator:
 ═══════════════════════════════════════════════════════════════
 CITATION REQUIREMENTS - MANDATORY
 ═══════════════════════════════════════════════════════════════
-- Add [number] IMMEDIATELY after every factual statement
-- Example: "Computer vision is an interdisciplinary field [1]."
-- Never make claims without citations
-- If information not found, say: "This information is not available in the provided materials"
+- Use citations like [1], [2], ... that refer to the provided sources.
+- Cite each major claim (1–2 citations per paragraph is fine).
+- Do not invent sources. If not found, say it’s not in the materials.
+
 
 ═══════════════════════════════════════════════════════════════
 RESPONSE FORMAT
@@ -1288,7 +2076,7 @@ RESPONSE FORMAT
     def generate_answer(
         self, retrieved_docs: List[Dict], question: str
     ) -> Tuple[str, List[Dict]]:
-        """Generate an answer with citations."""
+        """Generate an answer with citations and optional context compression."""
         question_lang = LanguageUtils.detect_language(question)
 
         if not retrieved_docs:
@@ -1299,14 +2087,29 @@ RESPONSE FORMAT
             )
             return no_info, []
 
+        # Apply context compression if enabled
+        docs_to_use = self.compress_contexts(retrieved_docs, question, question_lang)
+
         # Build context from parent texts
         context_parts = []
         sources = []
 
-        for i, doc in enumerate(retrieved_docs, 1):
-            parent_text = doc.get("parent_text", doc.get("child_text", ""))
+        for i, doc in enumerate(docs_to_use, 1):
+            parent_text = doc.get("parent_text", doc.get("document", ""))
             context_parts.append(f"[Source {i}]:\n{parent_text}")
-            sources.append(doc["metadata"])
+            meta = doc["metadata"]
+            sources.append(
+                {
+                    "id": doc["id"],                 # << key for evaluation
+                    "source": meta.get("source", ""),
+                    "page": meta.get("page", ""),
+                    "type": meta.get("type", ""),
+                    "lang": meta.get("lang", "en"),
+                    "parent_id": meta.get("parent_id", ""),
+                    "used_text": parent_text,        # << used for faithfulness eval
+                }
+            )
+
 
         context = "\n\n".join(context_parts)
 
@@ -1347,6 +2150,22 @@ STUDENT QUESTION: {question}
                     "⚠️ Response has few citations - answer quality may be limited"
                 )
 
+        if question_lang == "ar":
+            header = "المصادر:"
+            lines = [
+                f"[{i}] {s.get('source','')} - صفحة {s.get('page','')}"
+                for i, s in enumerate(sources, 1)
+            ]
+        else:
+            header = "Sources:"
+            lines = [
+                f"[{i}] {s.get('source','')} - page {s.get('page','')}"
+                for i, s in enumerate(sources, 1)
+            ]
+
+        answer = answer.strip() + "\n\n" + header + "\n" + "\n".join(lines)
+
+
         return answer, sources
 
     def generate_followups(
@@ -1385,6 +2204,433 @@ Output ONLY the questions, one per line, without numbering."""
 
 
 # ============================================================================
+# EVALUATION FRAMEWORK
+# ============================================================================
+@dataclass
+class EvalQuery:
+    """A single evaluation query with ground truth."""
+
+    query: str
+    language: str  # "ar" or "en"
+    ground_truth_answer: str
+    relevant_doc_ids: List[str]  # IDs of documents that should be retrieved
+    category: str = "general"  # e.g., "factual", "conceptual", "multi-hop"
+
+
+@dataclass
+class EvalResult:
+    """Result of evaluating a single query."""
+
+    query: str
+    language: str
+    retrieved_doc_ids: List[str]
+    answer: str
+
+    # Retrieval metrics
+    hit_rate: float  # 1 if any relevant doc retrieved, 0 otherwise
+    recall_at_k: float  # fraction of relevant docs retrieved
+    precision_at_k: float  # fraction of retrieved docs that are relevant
+    mrr: float  # Mean Reciprocal Rank
+
+    # Generation metrics (require LLM-as-judge)
+    faithfulness: Optional[float] = None
+    answer_relevancy: Optional[float] = None
+
+    # Metadata
+    latency_ms: float = 0.0
+    cache_hit: bool = False
+
+
+class RAGEvaluator:
+    """
+    Evaluation framework for the RAG pipeline.
+
+    Implements RAGAS-style metrics:
+    - Retrieval: Hit Rate, Recall@K, Precision@K, MRR
+    - Generation: Faithfulness, Answer Relevancy (using LLM-as-judge)
+    """
+
+    def __init__(self, rag_pipeline, llm_client: LLMClient):
+        self.rag_pipeline = rag_pipeline
+        self.llm_client = llm_client
+
+    def evaluate_retrieval(
+        self, retrieved_ids: List[str], relevant_ids: List[str]
+    ) -> Dict[str, float]:
+        """
+        Calculate retrieval metrics.
+
+        Returns dict with: hit_rate, recall_at_k, precision_at_k, mrr
+        """
+        if not relevant_ids:
+            return {
+                "hit_rate": 0.0,
+                "recall_at_k": 0.0,
+                "precision_at_k": 0.0,
+                "mrr": 0.0,
+            }
+
+        relevant_set = set(relevant_ids)
+
+        # Hit rate: 1 if any relevant doc in retrieved
+        hits = [1 if doc_id in relevant_set else 0 for doc_id in retrieved_ids]
+        hit_rate = 1.0 if any(hits) else 0.0
+
+        # Recall@K: fraction of relevant docs that were retrieved
+        retrieved_relevant = sum(
+            1 for doc_id in retrieved_ids if doc_id in relevant_set
+        )
+        recall_at_k = retrieved_relevant / len(relevant_ids)
+
+        # Precision@K: fraction of retrieved that are relevant
+        precision_at_k = (
+            retrieved_relevant / len(retrieved_ids) if retrieved_ids else 0.0
+        )
+
+        # MRR: 1 / position of first relevant doc
+        mrr = 0.0
+        for i, doc_id in enumerate(retrieved_ids, 1):
+            if doc_id in relevant_set:
+                mrr = 1.0 / i
+                break
+
+        return {
+            "hit_rate": hit_rate,
+            "recall_at_k": recall_at_k,
+            "precision_at_k": precision_at_k,
+            "mrr": mrr,
+        }
+
+    def evaluate_faithfulness(
+        self, question: str, answer: str, context: str, lang: str
+    ) -> float:
+        """
+        Evaluate if the answer is faithful to (grounded in) the context.
+
+        Uses LLM-as-judge to assess whether claims in the answer are supported
+        by the provided context.
+        """
+        if lang == "ar":
+            prompt = f"""قيّم مدى التزام الإجابة بالمصادر المقدمة.
+
+السؤال: {question}
+
+المصادر:
+{context[:2000]}
+
+الإجابة: {answer}
+
+أعط درجة من 0 إلى 1:
+- 1.0: كل المعلومات في الإجابة موجودة في المصادر
+- 0.5: بعض المعلومات مدعومة وبعضها لا
+- 0.0: الإجابة لا تتوافق مع المصادر
+
+اكتب الرقم فقط (مثال: 0.8)"""
+        else:
+            prompt = f"""Evaluate if the answer is faithful to (grounded in) the provided context.
+
+Question: {question}
+
+Context:
+{context[:2000]}
+
+Answer: {answer}
+
+Give a score from 0 to 1:
+- 1.0: All information in the answer is supported by the context
+- 0.5: Some information is supported, some is not
+- 0.0: The answer contradicts or is not grounded in the context
+
+Output ONLY the number (e.g., 0.8)"""
+
+        try:
+            result = self.llm_client.chat(
+                [{"role": "user", "content": prompt}],
+                temperature=0.1,
+                max_tokens=10,
+            )
+            score = float(re.search(r"[0-9.]+", result).group())
+            return min(1.0, max(0.0, score))
+        except Exception:
+            return 0.5  # Default to neutral if parsing fails
+
+    def evaluate_answer_relevancy(self, question: str, answer: str, lang: str) -> float:
+        """
+        Evaluate if the answer actually addresses the question.
+
+        Uses LLM-as-judge to assess relevancy.
+        """
+        if lang == "ar":
+            prompt = f"""قيّم مدى إجابة الرد على السؤال المطروح.
+
+السؤال: {question}
+
+الإجابة: {answer}
+
+أعط درجة من 0 إلى 1:
+- 1.0: الإجابة تجيب مباشرة وبشكل كامل على السؤال
+- 0.5: الإجابة جزئية أو غير مباشرة
+- 0.0: الإجابة لا تتعلق بالسؤال
+
+اكتب الرقم فقط (مثال: 0.8)"""
+        else:
+            prompt = f"""Evaluate if the answer addresses the question asked.
+
+Question: {question}
+
+Answer: {answer}
+
+Give a score from 0 to 1:
+- 1.0: The answer directly and completely addresses the question
+- 0.5: The answer is partial or indirect
+- 0.0: The answer does not relate to the question
+
+Output ONLY the number (e.g., 0.8)"""
+
+        try:
+            result = self.llm_client.chat(
+                [{"role": "user", "content": prompt}],
+                temperature=0.1,
+                max_tokens=10,
+            )
+            score = float(re.search(r"[0-9.]+", result).group())
+            return min(1.0, max(0.0, score))
+        except Exception:
+            return 0.5
+
+    def evaluate_single(self, eval_query: EvalQuery) -> EvalResult:
+        """Evaluate a single query."""
+        start_time = time.time()
+
+        # Run the RAG pipeline
+        answer, sources, followups, debug = self.rag_pipeline.answer(eval_query.query)
+
+        latency_ms = (time.time() - start_time) * 1000
+
+        # Get retrieved doc IDs
+        retrieved_ids = [s.get("id", "") for s in sources if s.get("id")]
+
+        # Calculate retrieval metrics
+        retrieval_metrics = self.evaluate_retrieval(
+            retrieved_ids, eval_query.relevant_doc_ids
+        )
+
+        # Build context string for faithfulness evaluation
+        context_parts = []
+        for i, s in enumerate(sources, 1):
+            context_parts.append(f"[{i}] {s.get('used_text', '')[:800]}")
+        context = "\n\n".join(context_parts)
+
+        # Calculate generation metrics
+        faithfulness = self.evaluate_faithfulness(
+            eval_query.query, answer, context, eval_query.language
+        )
+        answer_relevancy = self.evaluate_answer_relevancy(
+            eval_query.query, answer, eval_query.language
+        )
+
+        return EvalResult(
+            query=eval_query.query,
+            language=eval_query.language,
+            retrieved_doc_ids=retrieved_ids,
+            answer=answer,
+            hit_rate=retrieval_metrics["hit_rate"],
+            recall_at_k=retrieval_metrics["recall_at_k"],
+            precision_at_k=retrieval_metrics["precision_at_k"],
+            mrr=retrieval_metrics["mrr"],
+            faithfulness=faithfulness,
+            answer_relevancy=answer_relevancy,
+            latency_ms=latency_ms,
+            cache_hit=debug.get("cache_hit", False),
+        )
+
+    def evaluate_dataset(self, queries: List[EvalQuery]) -> Dict:
+        """
+        Evaluate a full dataset of queries.
+
+        Returns aggregate metrics and per-query results.
+        """
+        results = []
+
+        for query in queries:
+            result = self.evaluate_single(query)
+            results.append(result)
+
+        # Aggregate metrics
+        n = len(results)
+        if n == 0:
+            return {"error": "No queries to evaluate"}
+
+        # Split by language for language-specific metrics
+        ar_results = [r for r in results if r.language == "ar"]
+        en_results = [r for r in results if r.language == "en"]
+
+        def aggregate(result_list):
+            if not result_list:
+                return {}
+            n = len(result_list)
+            return {
+                "hit_rate": sum(r.hit_rate for r in result_list) / n,
+                "recall_at_k": sum(r.recall_at_k for r in result_list) / n,
+                "precision_at_k": sum(r.precision_at_k for r in result_list) / n,
+                "mrr": sum(r.mrr for r in result_list) / n,
+                "faithfulness": sum(r.faithfulness or 0 for r in result_list) / n,
+                "answer_relevancy": sum(r.answer_relevancy or 0 for r in result_list)
+                / n,
+                "avg_latency_ms": sum(r.latency_ms for r in result_list) / n,
+                "cache_hit_rate": sum(1 for r in result_list if r.cache_hit) / n,
+            }
+
+        return {
+            "overall": aggregate(results),
+            "arabic": aggregate(ar_results),
+            "english": aggregate(en_results),
+            "num_queries": n,
+            "num_arabic": len(ar_results),
+            "num_english": len(en_results),
+            "timestamp": datetime.now().isoformat(),
+            "results": [
+                {
+                    "query": r.query,
+                    "language": r.language,
+                    "hit_rate": r.hit_rate,
+                    "recall_at_k": r.recall_at_k,
+                    "faithfulness": r.faithfulness,
+                    "answer_relevancy": r.answer_relevancy,
+                    "latency_ms": r.latency_ms,
+                }
+                for r in results
+            ],
+        }
+
+def create_eval_dataset_from_corpus(collection, llm_client: LLMClient, n: int = 5) -> List[EvalQuery]:
+        """
+        Auto-generate evaluation queries from the currently ingested corpus.
+        Each query has a known relevant chunk id, so retrieval metrics are meaningful.
+        """
+        try:
+            count = collection.count()
+        except Exception:
+            count = 0
+
+        if count <= 0:
+            return []
+
+        # Get IDs (ok for homework-scale corpora)
+        all_ids = collection.get(include=[])["ids"]
+        sample_ids = random.sample(all_ids, k=min(n, len(all_ids)))
+
+        payload = collection.get(ids=sample_ids, include=["documents", "metadatas"])
+
+        eval_queries: List[EvalQuery] = []
+        for chunk_id, doc, meta in zip(payload["ids"], payload["documents"], payload["metadatas"]):
+            lang = meta.get("lang", "en")
+            excerpt = (meta.get("parent_text") or doc or "").strip()
+            excerpt = excerpt[:1500]
+
+            if not excerpt:
+                continue
+
+            if lang == "ar":
+                prompt = f"""
+    أنت تُنشئ أسئلة تقييم لنظام RAG.
+    اقرأ المقتطف، وأنشئ سؤالًا واحدًا يمكن الإجابة عنه من هذا المقتطف فقط، ثم إجابة مرجعية قصيرة.
+    أخرج JSON فقط بالشكل:
+    {{"question":"...","answer":"..."}}
+
+    المقتطف:
+    {excerpt}
+    """
+            else:
+                prompt = f"""
+    You are creating evaluation questions for a RAG system.
+    Read the excerpt and write ONE question that can be answered using ONLY this excerpt, plus a short reference answer.
+    Output STRICT JSON only:
+    {{"question":"...","answer":"..."}}
+
+    Excerpt:
+    {excerpt}
+    """
+
+            raw = llm_client.chat([{"role": "user", "content": prompt}], temperature=0.3, max_tokens=220)
+
+            # Parse JSON robustly
+            m = re.search(r"\{.*\}", raw, flags=re.DOTALL)
+            if not m:
+                continue
+            try:
+                obj = json.loads(m.group(0))
+                q = (obj.get("question") or "").strip()
+                a = (obj.get("answer") or "").strip()
+                if len(q) < 8 or len(a) < 5:
+                    continue
+            except Exception:
+                continue
+
+            eval_queries.append(
+                EvalQuery(
+                    query=q,
+                    language=lang,
+                    ground_truth_answer=a,
+                    relevant_doc_ids=[chunk_id],   # this is the key fix
+                    category="auto",
+                )
+            )
+
+        return eval_queries
+
+def create_sample_eval_dataset() -> List[EvalQuery]:
+    """
+    Create a sample evaluation dataset.
+
+    In practice, you would want 100+ queries covering:
+    - Different languages (Arabic/English)
+    - Different question types (factual, conceptual, multi-hop)
+    - Different difficulty levels
+    - Edge cases
+    """
+    return [
+        # English queries
+        EvalQuery(
+            query="What is RAG and why is it used?",
+            language="en",
+            ground_truth_answer="RAG (Retrieval-Augmented Generation) combines LLMs with external knowledge retrieval to ground responses in evidence, reducing hallucination.",
+            relevant_doc_ids=[],  # Fill with actual doc IDs from your corpus
+            category="conceptual",
+        ),
+        EvalQuery(
+            query="What are the different chunking strategies?",
+            language="en",
+            ground_truth_answer="Chunking strategies include fixed size, recursive, semantic, sentence-based, document-level, and agentic chunking.",
+            relevant_doc_ids=[],
+            category="factual",
+        ),
+        EvalQuery(
+            query="How does hybrid search work?",
+            language="en",
+            ground_truth_answer="Hybrid search combines vector similarity search with keyword-based BM25 search, fusing results using methods like RRF.",
+            relevant_doc_ids=[],
+            category="conceptual",
+        ),
+        # Arabic queries
+        EvalQuery(
+            query="ما هو RAG ولماذا يستخدم؟",
+            language="ar",
+            ground_truth_answer="RAG هو توليد معزز بالاسترجاع يجمع بين نماذج اللغة الكبيرة واسترجاع المعرفة الخارجية لتأسيس الردود على أدلة.",
+            relevant_doc_ids=[],
+            category="conceptual",
+        ),
+        EvalQuery(
+            query="ما هي استراتيجيات تقسيم النص؟",
+            language="ar",
+            ground_truth_answer="تشمل استراتيجيات التقسيم: الحجم الثابت، التقسيم المتكرر، الدلالي، على مستوى الجملة، على مستوى المستند.",
+            relevant_doc_ids=[],
+            category="factual",
+        ),
+    ]
+
+
+# ============================================================================
 # RAG PIPELINE
 # ============================================================================
 class RAGPipeline:
@@ -1408,6 +2654,10 @@ class RAGPipeline:
             "cache_similarity": None,
             "crag_used": False,
             "crag_metrics": None,
+            "hyde_used": CONFIG.ENABLE_HYDE,
+            "bm25_used": CONFIG.ENABLE_BM25,
+            "mmr_used": CONFIG.ENABLE_MMR,
+            "compression_used": CONFIG.ENABLE_CONTEXT_COMPRESSION,
         }
 
         # Get query embedding
@@ -1528,7 +2778,9 @@ class UIRenderer:
         st.markdown(f'<div class="{css_class}">{styled}</div>', unsafe_allow_html=True)
 
     @staticmethod
-    def render_followups(questions: List[str], question_lang: str) -> Optional[str]:
+    def render_followups(
+        questions: List[str], question_lang: str, message_idx: int = 0
+    ) -> Optional[str]:
         """Render follow-up question buttons."""
         if not questions:
             return None
@@ -1541,11 +2793,34 @@ class UIRenderer:
         cols = st.columns(len(questions))
         for i, (col, q) in enumerate(zip(cols, questions)):
             with col:
-                if st.button(
-                    q, key=f"followup_{i}_{hash(q)}", use_container_width=True
-                ):
+                # Use message_idx + question index + timestamp-based unique ID to ensure uniqueness
+                unique_key = f"followup_msg{message_idx}_q{i}_{hash(q)}_{id(q)}"
+                if st.button(q, key=unique_key, use_container_width=True):
                     return q
         return None
+
+    @staticmethod
+    def render_eval_metrics(metrics: Dict):
+        """Render evaluation metrics in a nice format."""
+        st.markdown("### 📊 Evaluation Results")
+
+        col1, col2, col3 = st.columns(3)
+
+        with col1:
+            st.markdown("**Retrieval Metrics**")
+            st.metric("Hit Rate", f"{metrics.get('hit_rate', 0):.2%}")
+            st.metric("Recall@K", f"{metrics.get('recall_at_k', 0):.2%}")
+            st.metric("MRR", f"{metrics.get('mrr', 0):.3f}")
+
+        with col2:
+            st.markdown("**Generation Metrics**")
+            st.metric("Faithfulness", f"{metrics.get('faithfulness', 0):.2%}")
+            st.metric("Answer Relevancy", f"{metrics.get('answer_relevancy', 0):.2%}")
+
+        with col3:
+            st.markdown("**Performance**")
+            st.metric("Avg Latency", f"{metrics.get('avg_latency_ms', 0):.0f} ms")
+            st.metric("Cache Hit Rate", f"{metrics.get('cache_hit_rate', 0):.2%}")
 
     @classmethod
     def render_message(
@@ -1555,6 +2830,7 @@ class UIRenderer:
         sources: List[Dict] = None,
         followups: List[str] = None,
         question_lang: str = "en",
+        message_idx: int = 0,
     ) -> Optional[str]:
         """Render a chat message."""
         if role == "user":
@@ -1569,7 +2845,7 @@ class UIRenderer:
                 cls.render_source_cards(sources)
             cls.render_answer(content, LanguageUtils.detect_language(content) == "ar")
             if followups:
-                return cls.render_followups(followups, question_lang)
+                return cls.render_followups(followups, question_lang, message_idx)
         return None
 
 
@@ -1602,6 +2878,19 @@ def render_sidebar():
             st.session_state.api_key = api_key
 
         st.markdown(f"[🔑 Get free API key]({provider_config['get_key_url']})")
+
+        # Test connection button
+        if st.session_state.api_key:
+            if st.button("🔌 Test Connection", use_container_width=True):
+                with st.spinner("Testing connection..."):
+                    test_client = LLMClient(
+                        st.session_state.selected_provider, st.session_state.api_key
+                    )
+                    success, message = test_client.test_connection()
+                    if success:
+                        st.success(f"✅ {message}")
+                    else:
+                        st.error(f"❌ {message}")
 
         st.markdown("---")
         st.markdown("### 📄 Documents")
@@ -1648,20 +2937,65 @@ def render_sidebar():
         st.markdown("### 🔧 Advanced Settings")
 
         with st.expander("Retrieval Settings"):
-            st.caption("Currently using:")
-            st.caption(f"• Parent chunks: {CONFIG.PARENT_CHUNK_SIZE} tokens")
-            st.caption(f"• Child chunks: {CONFIG.CHILD_CHUNK_SIZE} tokens")
-            st.caption(f"• Top-K results: {CONFIG.TOP_K}")
-            st.caption(f"• Multi-query count: {CONFIG.MULTI_QUERY_COUNT}")
-            st.caption("• Hybrid search: Vector + Keyword")
-            st.caption("• Parent-child chunking: Enabled")
+            st.caption("**Chunking:**")
+            st.caption(f"• Parent: {CONFIG.PARENT_CHUNK_SIZE} tokens")
+            st.caption(f"• Child: {CONFIG.CHILD_CHUNK_SIZE} tokens")
+            st.caption(f"• Top-K: {CONFIG.TOP_K}")
+
+            st.caption("**Search:**")
+            st.caption(f"• Vector Search: ✅ Enabled")
+            st.caption(f"• BM25 Search: {'✅' if CONFIG.ENABLE_BM25 else '❌'}")
+            st.caption(f"• HyDE: {'✅' if CONFIG.ENABLE_HYDE else '❌'}")
+            st.caption(f"• Multi-Query: {CONFIG.MULTI_QUERY_COUNT} variations")
+
+            st.caption("**Post-Processing:**")
+            st.caption(f"• Reranking: {'✅' if CONFIG.ENABLE_RERANKING else '❌'}")
             st.caption(
-                f"• Reranking: {'Enabled' if CONFIG.ENABLE_RERANKING else 'Disabled'}"
+                f"• MMR (λ={CONFIG.MMR_LAMBDA}): {'✅' if CONFIG.ENABLE_MMR else '❌'}"
             )
+            st.caption(f"• CRAG: {'✅' if CONFIG.ENABLE_CRAG else '❌'}")
             st.caption(
-                f"• Semantic cache: {'Enabled' if CONFIG.ENABLE_SEMANTIC_CACHE else 'Disabled'}"
+                f"• Context Compression: {'✅' if CONFIG.ENABLE_CONTEXT_COMPRESSION else '❌'}"
             )
-            st.caption(f"• CRAG: {'Enabled' if CONFIG.ENABLE_CRAG else 'Disabled'}")
+
+            st.caption("**Caching:**")
+            st.caption(
+                f"• Semantic Cache: {'✅' if CONFIG.ENABLE_SEMANTIC_CACHE else '❌'}"
+            )
+
+            st.caption("**Arabic:**")
+            st.caption(
+                f"• Morphology: {'✅' if CONFIG.ENABLE_ARABIC_MORPHOLOGY else '❌'}"
+            )
+
+        with st.expander("🔬 Run Evaluation"):
+            if st.button("Run Sample Evaluation", use_container_width=True):
+                if not st.session_state.api_key:
+                    st.error("API key required")
+                else:
+                    with st.spinner("Running evaluation..."):
+                        llm_client = LLMClient(
+                            st.session_state.selected_provider, st.session_state.api_key
+                        )
+                        embedder = load_embedder()
+                        _, collection = get_chroma_collection()
+
+                        pipeline = RAGPipeline(llm_client, embedder, collection)
+                        evaluator = RAGEvaluator(pipeline, llm_client)
+
+                        eval_queries = create_eval_dataset_from_corpus(collection, llm_client, n=5)
+                        if not eval_queries:
+                            st.error("No documents found (or could not generate eval set). Ingest documents first.")
+                            st.stop()
+
+                        results = evaluator.evaluate_dataset(eval_queries)
+
+                        # Save results
+                        with open(CONFIG.EVAL_RESULTS_PATH, "w") as f:
+                            json.dump(results, f, indent=2)
+
+                        st.success("Evaluation complete!")
+                        UIRenderer.render_eval_metrics(results.get("overall", {}))
 
         st.markdown("---")
         col1, col2 = st.columns(2)
@@ -1676,10 +3010,16 @@ def render_sidebar():
                 try:
                     client, _ = get_chroma_collection()
                     client.reset()
-                    for key in ["chroma_client", "chroma_collection"]:
+                    for key in ["chroma_client", "chroma_collection", "bm25_manager"]:
                         if key in st.session_state:
                             del st.session_state[key]
                     st.session_state.semantic_cache = OrderedDict()
+
+                    # Delete BM25 index file
+                    bm25_path = Path(CONFIG.BM25_INDEX_PATH)
+                    if bm25_path.exists():
+                        bm25_path.unlink()
+
                     st.success("Database reset!")
                     st.rerun()
                 except Exception as e:
@@ -1718,8 +3058,8 @@ def main():
         <div style="text-align: center; margin-bottom: 2rem;">
             <span class="provider-badge">⚡ Powered by {provider_name} • {model_name.split('/')[-1]}</span>
             <br><br>
-            <span class="provider-badge">🚀 Enhanced RAG: Hierarchical Chunking • Hybrid Search • 
-            Multi-Query • Reranking • CRAG • Semantic Cache</span>
+            <span class="provider-badge">🚀 Enhanced RAG: True Hybrid Search (BM25+Vector) • HyDE • 
+            Arabic Morphology • MMR Diversity • Context Compression • CRAG</span>
         </div>
         """,
             unsafe_allow_html=True,
@@ -1737,13 +3077,14 @@ def main():
 
     # Render chat history
     followup_clicked = None
-    for msg in st.session_state.chat_history:
+    for msg_idx, msg in enumerate(st.session_state.chat_history):
         result = UIRenderer.render_message(
             msg["role"],
             msg["content"],
             msg.get("sources"),
             msg.get("followups"),
             msg.get("question_lang", "en"),
+            message_idx=msg_idx,
         )
         if result:
             followup_clicked = result
@@ -1779,16 +3120,24 @@ def main():
                 answer, sources, followups, debug = pipeline.answer(question)
 
                 # Show debug info
+                debug_parts = []
                 if debug.get("cache_hit"):
                     sim = debug.get("cache_similarity")
-                    if sim is not None:
-                        st.caption(f"Cache hit (similarity: {sim:.3f})")
-
-                if debug.get("crag_used") and debug.get("crag_metrics"):
-                    m = debug["crag_metrics"]
-                    st.caption(
-                        f"CRAG corrective retrieval used (max_rel={m['max_relevance']:.2f})"
+                    debug_parts.append(f"Cache hit ({sim:.3f})" if sim else "Cache hit")
+                if debug.get("crag_used"):
+                    m = debug.get("crag_metrics", {})
+                    debug_parts.append(
+                        f"CRAG (max_rel={m.get('max_relevance', 0):.2f})"
                     )
+                if debug.get("hyde_used"):
+                    debug_parts.append("HyDE")
+                if debug.get("bm25_used"):
+                    debug_parts.append("BM25")
+                if debug.get("mmr_used"):
+                    debug_parts.append("MMR")
+
+                if debug_parts:
+                    st.caption(f"🔧 Features used: {' • '.join(debug_parts)}")
 
             st.session_state.chat_history.append(
                 {
@@ -1807,9 +3156,9 @@ def main():
     st.markdown(
         f"""
     <div style="text-align: center; color: #666; font-size: 0.85rem;">
-        <strong>Enhanced RAG Architecture:</strong> Hierarchical Parent-Child Chunking • 
-        Hybrid Search (Vector + Keyword) • Multi-Query Generation • Cross-lingual Retrieval • 
-        Cross-Encoder Reranking • CRAG Validation • Semantic Cache<br>
+        <strong>Enhanced RAG Architecture:</strong> True Hybrid Search (BM25 + Vector) • 
+        HyDE • Arabic Morphology (CAMeL) • Multi-Query • Cross-lingual • 
+        Reranking • MMR Diversity • CRAG • Context Compression • Semantic Cache<br>
         <strong>Powered by:</strong> {provider_name} • ChromaDB • E5-multilingual-small
     </div>
     """,
