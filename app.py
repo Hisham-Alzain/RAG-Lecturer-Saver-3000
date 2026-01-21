@@ -1735,11 +1735,58 @@ class Retriever:
             return True
         return False
 
+    def detect_comparison_query(self, question: str, question_lang: str) -> List[str]:
+        """
+        Detect if a question is asking to compare/contrast topics and extract individual topics.
+        
+        For example:
+        - "compare RGB and HSV" -> ["RGB", "HSV"]
+        - "what's the difference between CNN and RNN" -> ["CNN", "RNN"]
+        - "قارن بين RGB و HSV" -> ["RGB", "HSV"]
+        
+        Returns empty list if not a comparison question.
+        """
+        # Comparison patterns in English
+        en_patterns = [
+            r"compare\s+(.+?)\s+(?:and|with|to|vs\.?|versus)\s+(.+)",
+            r"difference(?:s)?\s+between\s+(.+?)\s+(?:and|&)\s+(.+)",
+            r"(.+?)\s+vs\.?\s+(.+)",
+            r"contrast\s+(.+?)\s+(?:and|with)\s+(.+)",
+            r"(.+?)\s+compared\s+to\s+(.+)",
+            r"how\s+(?:does|do|is|are)\s+(.+?)\s+differ\s+from\s+(.+)",
+        ]
+        
+        # Comparison patterns in Arabic
+        ar_patterns = [
+            r"قارن\s+(?:بين\s+)?(.+?)\s+(?:و|مع)\s+(.+)",
+            r"الفرق\s+بين\s+(.+?)\s+(?:و|&)\s+(.+)",
+            r"ما\s+(?:هو\s+)?الفرق\s+بين\s+(.+?)\s+(?:و|&)\s+(.+)",
+            r"(.+?)\s+مقابل\s+(.+)",
+            r"مقارنة\s+(?:بين\s+)?(.+?)\s+(?:و|مع)\s+(.+)",
+        ]
+        
+        patterns = ar_patterns if question_lang == "ar" else en_patterns
+        
+        for pattern in patterns:
+            match = re.search(pattern, question, re.IGNORECASE)
+            if match:
+                topic1 = match.group(1).strip().strip('?.,')
+                topic2 = match.group(2).strip().strip('?.,')
+                # Clean up common artifacts
+                topic1 = re.sub(r'^(the|a|an)\s+', '', topic1, flags=re.IGNORECASE)
+                topic2 = re.sub(r'^(the|a|an)\s+', '', topic2, flags=re.IGNORECASE)
+                if topic1 and topic2:
+                    return [topic1, topic2]
+        
+        return []
+
     def retrieve(
         self, question: str, per_query_k: int = 5, final_k: int = None
     ) -> Tuple[List[Dict], Dict]:
         """
         Full retrieval pipeline with multi-query, HyDE, hybrid search, reranking, MMR, and CRAG.
+        
+        Now includes special handling for comparison queries to retrieve each topic separately.
         """
         if final_k is None:
             final_k = CONFIG.TOP_K
@@ -1751,15 +1798,38 @@ class Retriever:
             "hyde_used": CONFIG.ENABLE_HYDE,
             "bm25_used": CONFIG.ENABLE_BM25,
             "mmr_used": CONFIG.ENABLE_MMR,
+            "comparison_detected": False,
+            "comparison_topics": [],
         }
 
         question_lang = LanguageUtils.detect_language(question)
 
+        # Check if this is a comparison query
+        comparison_topics = self.detect_comparison_query(question, question_lang)
+        
         # Generate query variations
         query_variations = [question]
         query_variations.extend(
             self.llm_client.generate_multi_queries(question, question_lang)
         )
+        
+        # If comparison detected, add individual topic queries
+        if comparison_topics:
+            debug["comparison_detected"] = True
+            debug["comparison_topics"] = comparison_topics
+            
+            # Add queries for each topic individually
+            for topic in comparison_topics:
+                # Add "what is X" style queries
+                if question_lang == "ar":
+                    query_variations.append(f"ما هو {topic}")
+                    query_variations.append(f"تعريف {topic}")
+                    query_variations.append(topic)
+                else:
+                    query_variations.append(f"what is {topic}")
+                    query_variations.append(f"{topic} definition")
+                    query_variations.append(f"{topic} explanation")
+                    query_variations.append(topic)
 
         # Add translated query
         translated = self.llm_client.translate_query(question, question_lang)
@@ -1964,7 +2034,7 @@ class SemanticCache:
 
 
 # ============================================================================
-# ANSWER GENERATION
+# ANSWER GENERATION - FIXED VERSION
 # ============================================================================
 class AnswerGenerator:
     """Generate answers with proper citations, context compression, and language handling."""
@@ -2027,8 +2097,32 @@ class AnswerGenerator:
         return compressed_docs
 
     def get_arabic_system_prompt(self) -> str:
-        """Get the system prompt for Arabic responses."""
+        """Get the system prompt for Arabic responses - FIXED VERSION."""
         return """أنت مدرس جامعي متخصص في مجالات هندسة الذكاء الاصطناعي (الرؤية الحاسوبية، معالجة اللغات الطبيعية، التعلم الآلي).
+
+═══════════════════════════════════════════════════════════════
+قاعدة حاسمة - المصادر المقدمة فقط
+═══════════════════════════════════════════════════════════════
+يجب أن تستخدم فقط المعلومات من المصادر المقدمة. لا تستخدم معرفتك العامة أبداً.
+- إذا لم تكن المعلومات في المصادر: قل "هذه المعلومات غير متوفرة في مواد المحاضرات المقدمة."
+- إذا كانت المعلومات متوفرة جزئياً: أجب فقط بما تحتويه المصادر، استشهد به، واذكر ما هو ناقص.
+- لا تقل أبداً "بناءً على المعرفة العامة" أو تجب بدون استشهادات.
+
+═══════════════════════════════════════════════════════════════
+التعامل مع أسئلة المقارنة/التوليف
+═══════════════════════════════════════════════════════════════
+إذا طُلب منك مقارنة أو ربط موضوعات (مثل: "قارن بين RGB و HSV"):
+1. تحقق مما إذا كان كل موضوع موصوفاً في المصادر (ربما في مصادر مختلفة)
+2. إذا كان الموضوع أ في [1] والموضوع ب في [3]: قم بالتوليف بشرح كل منهما من مصدره مع الاستشهادات الصحيحة
+3. إذا وُجد موضوع واحد فقط: اشرح ما وجدته واذكر أن الآخر غير موجود في المواد
+4. إذا لم يُوجد أي منهما: اذكر بوضوح أن هذه المعلومات غير موجودة في المواد المقدمة
+
+═══════════════════════════════════════════════════════════════
+قواعد الاستشهاد - إلزامية
+═══════════════════════════════════════════════════════════════
+- استخدم استشهادات مثل [1]، [2]، ... التي تشير إلى المصادر المقدمة.
+- كل ادعاء واقعي يجب أن يكون له استشهاد. بدون استثناءات.
+- لا تخترع مصادر أو معلومات.
 
 ═══════════════════════════════════════════════════════════════
 قواعد اللغة - إلزامية
@@ -2039,31 +2133,40 @@ class AnswerGenerator:
 - مثال خاطئ: "Computer Vision هو مجال" أو "الـ processing"
 
 ═══════════════════════════════════════════════════════════════
-قواعد الاستشهاد - إلزامية
-═══════════════════════════════════════════════════════════════
-- Use citations like [1], [2], ... that refer to the provided sources.
-- Cite each major claim (1–2 citations per paragraph is fine).
-- Do not invent sources. If not found, say it’s not in the materials.
-
-═══════════════════════════════════════════════════════════════
 تنسيق الإجابة
 ═══════════════════════════════════════════════════════════════
 - اكتب فقرات متصلة (ليس نقاط)
 - استخدم علامات الترقيم العربية: ، ؛ ؟
 - أسلوب أكاديمي واضح
-- 150-250 كلمة تقريباً"""
+- 150-250 كلمة تقريباً (أقصر إذا كانت المواد المصدرية محدودة)"""
 
     def get_english_system_prompt(self) -> str:
-        """Get the system prompt for English responses."""
+        """Get the system prompt for English responses - FIXED VERSION."""
         return """You are a university tutor specializing in AI Engineering (Computer Vision, NLP, Machine Learning).
+
+═══════════════════════════════════════════════════════════════
+CRITICAL RULE - SOURCE MATERIAL ONLY
+═══════════════════════════════════════════════════════════════
+You must ONLY use information from the provided sources. NEVER use your general knowledge.
+- If information is NOT in the sources: Say "This information is not available in the provided lecture materials."
+- If information IS partially available: Answer ONLY what the sources contain, cite it, and note what's missing.
+- NEVER say things like "based on general knowledge" or answer without citations.
+
+═══════════════════════════════════════════════════════════════
+HANDLING COMPARISON/SYNTHESIS QUESTIONS
+═══════════════════════════════════════════════════════════════
+If asked to compare, contrast, or relate topics (e.g., "compare RGB and HSV"):
+1. Check if EACH topic is described in the sources (possibly in different sources)
+2. If Topic A is in [1] and Topic B is in [3]: Synthesize by explaining each from its source with proper citations
+3. If only ONE topic is found: Explain what you found and state the other is not in the materials
+4. If NEITHER is found: State clearly that this information is not in the provided materials
 
 ═══════════════════════════════════════════════════════════════
 CITATION REQUIREMENTS - MANDATORY
 ═══════════════════════════════════════════════════════════════
 - Use citations like [1], [2], ... that refer to the provided sources.
-- Cite each major claim (1–2 citations per paragraph is fine).
-- Do not invent sources. If not found, say it’s not in the materials.
-
+- EVERY factual claim MUST have a citation. No exceptions.
+- Do not invent sources or information.
 
 ═══════════════════════════════════════════════════════════════
 RESPONSE FORMAT
@@ -2071,7 +2174,7 @@ RESPONSE FORMAT
 - Write in clear, flowing paragraphs (NOT bullet points)
 - Academic but accessible language
 - Translate any Arabic content from sources to English
-- Aim for 150-250 words"""
+- Aim for 150-250 words (shorter if limited source material)"""
 
     def generate_answer(
         self, retrieved_docs: List[Dict], question: str
@@ -2081,9 +2184,9 @@ RESPONSE FORMAT
 
         if not retrieved_docs:
             no_info = (
-                "لا تتوفر معلومات ذات صلة في المستندات المرفوعة."
+                "لا تتوفر معلومات ذات صلة في المستندات المرفوعة. الرجاء التأكد من رفع مواد المحاضرات ذات الصلة."
                 if question_lang == "ar"
-                else "I couldn't find relevant information in the uploaded documents."
+                else "I couldn't find relevant information in the uploaded documents. Please make sure to upload the relevant lecture materials."
             )
             return no_info, []
 
@@ -2116,10 +2219,18 @@ RESPONSE FORMAT
         # Select system prompt based on language
         if question_lang == "ar":
             system_prompt = self.get_arabic_system_prompt()
-            reminder = "تذكير: اكتب بالعربية فقط، مع المصطلحات التقنية بين قوسين بالإنجليزية. استشهد بكل معلومة."
+            reminder = """تذكير مهم: 
+1. اكتب بالعربية فقط، مع المصطلحات التقنية بين قوسين بالإنجليزية
+2. استشهد بكل معلومة من المصادر
+3. إذا لم تجد المعلومة في المصادر، قل ذلك بوضوح
+4. لا تستخدم معرفتك العامة أبداً"""
         else:
             system_prompt = self.get_english_system_prompt()
-            reminder = "REMINDER: Write in English only. Cite every fact."
+            reminder = """CRITICAL REMINDER: 
+1. ONLY use information from the sources above
+2. Cite every fact with [1], [2], etc.
+3. If the information is not in the sources, say so clearly
+4. NEVER use your general knowledge - if it's not cited, don't say it"""
 
         messages = [
             {"role": "system", "content": system_prompt},
@@ -2134,8 +2245,8 @@ STUDENT QUESTION: {question}
             },
         ]
 
-        # Lower temperature for Arabic to reduce hallucination
-        temperature = 0.3 if question_lang == "ar" else 0.5
+        # Lower temperature for more factual responses
+        temperature = 0.2 if question_lang == "ar" else 0.3
 
         answer = self.llm_client.chat(messages, temperature=temperature)
 
@@ -2145,9 +2256,17 @@ STUDENT QUESTION: {question}
 
             # Check citation count
             citations = re.findall(r"\[\d+\]", answer)
-            if len(citations) < 2:
+            if len(citations) < 1 and "غير متوفرة" not in answer and "غير موجودة" not in answer:
                 st.warning(
-                    "⚠️ Response has few citations - answer quality may be limited"
+                    "⚠️ Response has no citations - the information may not be in the source materials"
+                )
+
+        # Check English responses for missing citations
+        if question_lang == "en":
+            citations = re.findall(r"\[\d+\]", answer)
+            if len(citations) < 1 and "not available" not in answer.lower() and "not in the" not in answer.lower():
+                st.warning(
+                    "⚠️ Response has no citations - the information may not be in the source materials"
                 )
 
         if question_lang == "ar":
@@ -3124,6 +3243,9 @@ def main():
                 if debug.get("cache_hit"):
                     sim = debug.get("cache_similarity")
                     debug_parts.append(f"Cache hit ({sim:.3f})" if sim else "Cache hit")
+                if debug.get("comparison_detected"):
+                    topics = debug.get("comparison_topics", [])
+                    debug_parts.append(f"Comparison: {' vs '.join(topics)}")
                 if debug.get("crag_used"):
                     m = debug.get("crag_metrics", {})
                     debug_parts.append(
