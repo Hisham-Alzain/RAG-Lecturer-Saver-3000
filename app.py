@@ -13,7 +13,7 @@ from typing import List, Dict, Tuple, Optional
 from dataclasses import dataclass, field
 
 # Third-party imports
-from sentence-transformers import SentenceTransformer, CrossEncoder
+from sentence_transformers import SentenceTransformer, CrossEncoder
 from chromadb import PersistentClient
 from chromadb.config import Settings
 from pptx import Presentation
